@@ -62,7 +62,15 @@ pub mod musechain_escrow {
             authority: lock_account.to_account_info(),
         };
 
-        let inner = vec![b"escrow", ctx.accounts.mint_address.key.as_ref()];
+        let inner = vec![b"escrow", ctx.accounts.mint_address.key.as_ref()]; /*
+        
+        ERROR
+        {unknown}
+        attempted to take value of method `key` on type `anchor_lang::prelude::Account<'_, TokenAccount>`
+        method, not a fieldrustcE0615
+        lib.rs(65, 66): use parentheses to call the method: `()`
+        */
+
         let outer = vec![inner.as_slice()];
 
         let cpi_ctx = CpiContext::new_with_signer(
