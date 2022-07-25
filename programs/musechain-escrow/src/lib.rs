@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{CloseAccount, Token, TokenAccount, Transfer};
+use anchor_spl::token::{CloseAccount, Token, TokenAccount, Transfer, Mint};
 
 declare_id!("3tB4rGwEj3B8YjozEBTHL5f8Tzubq9kiYJP4E6nyKQDX");
 
@@ -9,72 +9,79 @@ pub mod musechain_escrow {
 
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, mint_address: Pubkey) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let lock_account = &mut ctx.accounts.lock_account;
-        lock_account.owner = *ctx.accounts.owner.key;
-        lock_account.authority = ctx.accounts.owner.key().clone();
-        lock_account.bump = *ctx.bumps.get("owner").unwrap();
-        lock_account.mint_address = mint_address;
-        lock_account.escrow_bump = *ctx.bumps.get("escrow").unwrap();
-        lock_account.escrow_pda = *ctx.accounts.lock_escrow_account.to_account_info().key;
+        lock_account.owner = ctx.accounts.owner.key();
+        lock_account.mint_address = ctx.accounts.mint_address.key();
         Ok(())
     }
 
-    pub fn list_nft(ctx: Context<ListNFT>, price: u64) -> Result<()> {
+    pub fn list_nft(ctx: Context<ListNFT>, lock_account_bump: u8, escrow_token_bump: u8,  price: u64) -> Result<()> {
         let lock_account = &mut ctx.accounts.lock_account;
-        let lock_escrow_account = &mut ctx.accounts.lock_escrow_account;
-        lock_escrow_account.price = price;
-        lock_escrow_account.owner = ctx.accounts.owner.key().clone();
-        lock_escrow_account.mint = ctx.accounts.mint_address.key().clone();
+        lock_account.price = price;
+        let mint = ctx.accounts.mint_address.key();
 
+        let bump_vector = lock_account_bump.to_le_bytes();
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let inner = vec![
+            b"owner".as_ref(),
+            ctx.accounts.owner.key.as_ref(),
+            mint.as_ref(),
+            bump_vector.as_ref(),
+        ];
+
+        let outer = vec![inner.as_slice()];
         let transfer_instruction = Transfer {
-            from: ctx.accounts.owner.to_account_info(),
-            to: ctx.accounts.lock_escrow_account.to_account_info(),
+            from: ctx.accounts.nft_account.to_account_info(),
+            to: ctx.accounts.escrow_token_account.to_account_info(),
             authority: ctx.accounts.owner.to_account_info(),
         };
-
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-
         // Create the Context for our Transfer request
-        let cpi_ctx = CpiContext::new(cpi_program, transfer_instruction);
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, transfer_instruction, outer.as_slice());
 
         // Execute anchor's helper function to transfer tokens
         anchor_spl::token::transfer(cpi_ctx, 1)?;
         Ok(())
     }
 
-    pub fn buy(ctx: Context<Buy>, lamports: u64, mint_address: Pubkey) -> Result<()> {
+    pub fn buy(ctx: Context<Buy>, lock_account_bump: u8, escrow_token_bump: u8) -> Result<()> {
         let lock_account = &mut ctx.accounts.lock_account;
-        let lock_escrow_account = &mut ctx.accounts.lock_escrow_account;
-
-        **lock_escrow_account
-            .to_account_info()
-            .try_borrow_mut_lamports()? -= lamports;
-        **ctx
-            .accounts
-            .buyer
-            .to_account_info()
-            .try_borrow_mut_lamports()? += lamports;
-
-        let transfer_instruction = Transfer {
-            from: ctx.accounts.lock_escrow_account.to_account_info(),
-            to: ctx.accounts.buyer.to_account_info(),
-            authority: lock_account.to_account_info(),
-        };
-
-        let inner = vec![b"escrow", ctx.accounts.mint_address.key.as_ref()]; /*
-        
-        ERROR
-        {unknown}
-        attempted to take value of method `key` on type `anchor_lang::prelude::Account<'_, TokenAccount>`
-        method, not a fieldrustcE0615
-        lib.rs(65, 66): use parentheses to call the method: `()`
-        */
+        if ctx.accounts.seller.key() != lock_account.owner {
+            return Err(error!(ErrorCode::InvalidSeller))
+        }
+        let mint = ctx.accounts.mint_address.key();
+        if ctx.accounts.seller.key() != ctx.accounts.buyer.key() {
+            let first_ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.buyer.key(),
+                &ctx.accounts.seller.key(),
+                lock_account.price,
+            );
+            anchor_lang::solana_program::program::invoke(
+                &first_ix,
+                &[
+                    ctx.accounts.buyer.to_account_info(),
+                    ctx.accounts.seller.to_account_info(),
+                ],
+            );
+        }
+        let bump_vector = lock_account_bump.to_le_bytes();
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let inner = vec![
+            b"owner".as_ref(),
+            ctx.accounts.seller.key.as_ref(),
+            mint.as_ref(),
+            bump_vector.as_ref(),
+        ];
 
         let outer = vec![inner.as_slice()];
+        let transfer_instruction = Transfer {
+            from: ctx.accounts.escrow_token_account.to_account_info(),
+            to: ctx.accounts.buyer_token_account.to_account_info(),
+            authority: lock_account.to_account_info(),
+        };  
 
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            cpi_program,
             transfer_instruction,
             outer.as_slice(),
         );
@@ -88,71 +95,67 @@ pub mod musechain_escrow {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = owner, space=8+32+32+32+1+1+32, seeds=[b"owner", owner.key().as_ref()], bump)]
+    #[account(init, payer = owner, space=8+32+32+32+1+1+32, seeds=[b"owner", owner.key().as_ref(), mint_address.key().as_ref()], bump)]
     pub lock_account: Account<'info, LockAccount>,
-
-    #[account(init, payer = owner, space=8+1+32+32, seeds=[b"escrow", mint_address.key().as_ref()], bump)]
-    pub lock_escrow_account: Account<'info, LockEscrowAccount>,
-
+    #[account(init, payer = owner, seeds = [b"token", owner.key().as_ref(), mint_address.key().as_ref()], bump, token::mint = mint_address, token::authority = lock_account)]
+    pub escrow_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub owner: Signer<'info>,
-
     #[account(mut)]
-    pub mint_address: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
+    pub mint_address: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>
 }
 
 #[derive(Accounts)]
+#[instruction(lock_account_bump: u8, escrow_wallet_bump: u8)]
 pub struct ListNFT<'info> {
-    #[account(has_one = owner)]
+    #[account(mut, seeds = [b"owner", owner.key().as_ref(), mint_address.key().as_ref()] , bump = lock_account_bump, has_one = owner)]
     pub lock_account: Account<'info, LockAccount>,
-
-    /// CHECK: There is no reason I can think of as to why this is unsafe.
-    #[account(signer)]
-    pub owner: AccountInfo<'info>,
-
+    #[account(mut, seeds = [b"token", owner.key().as_ref(), mint_address.key().as_ref()], bump = escrow_wallet_bump)]
+    pub escrow_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub mint_address: Account<'info, TokenAccount>,
+    pub owner: Signer<'info>,
+    #[account(mut)]
+    pub nft_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub mint_address: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-
-    #[account( mut, constraint = lock_account.escrow_pda == *lock_escrow_account.to_account_info().key)]
-    pub lock_escrow_account: Account<'info, LockEscrowAccount>,
+    pub rent: Sysvar<'info, Rent>
 }
 
 #[derive(Accounts)]
+#[instruction(lock_account_bump: u8, escrow_token_bump: u8)]
 pub struct Buy<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"owner", seller.key().as_ref(), mint_address.key().as_ref()] , bump = lock_account_bump)]
     pub lock_account: Account<'info, LockAccount>,
-
-    #[account(mut, signer)]
-    pub buyer: AccountInfo<'info>,
-    pub system_program: Program<'info, System>,
-
-    #[account(mut, constraint = lock_account.escrow_pda == *lock_escrow_account.to_account_info().key)]
-    //How do I add a constraint where the lamports must equal price?
-    //#[account( mut)]
-    pub lock_escrow_account: Account<'info, LockEscrowAccount>,
-
+    #[account(mut, seeds = [b"token", seller.key().as_ref(), mint_address.key().as_ref()], bump = escrow_token_bump)]
+    pub escrow_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub mint_address: Account<'info, TokenAccount>,
+    pub buyer: Signer<'info>,
+    #[account(mut)]
+    ///CHECK:
+    pub seller: AccountInfo<'info>,
+    #[account(mut)]
+    pub buyer_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub mint_address: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>
 }
 
 #[account]
 pub struct LockAccount {
     pub owner: Pubkey,        //32 bytes
-    pub authority: Pubkey,    //32 bytes
     pub mint_address: Pubkey, //32 bytes
-    pub bump: u8,             // 32 bytes
-    pub escrow_bump: u8,      //32 bytes
-    pub escrow_pda: Pubkey,   //32 bytes
+    pub price: u64, // 8 bytes
 }
 
-#[account]
-pub struct LockEscrowAccount {
-    pub price: u64,
-    pub owner: Pubkey,
-    pub mint: Pubkey,
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Invalid seller account, please send the right account again")]
+    InvalidSeller
 }
